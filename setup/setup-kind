@@ -204,6 +204,8 @@ _kubectl_wait() {
     # Poll until resources exist using kubectl get (without --for, --all, and --timeout)
     # For List resources: check if items array has non-zero length
     # For named resources: kubectl get will error if not found, so check exit code
+    # Temporarily disable set -e to handle expected failures gracefully
+    set +e
     local elapsed=0
     local json_output
     local exit_code
@@ -234,12 +236,15 @@ _kubectl_wait() {
         fi
 
         if [ $elapsed -ge $poll_timeout ]; then
+            set -e
             echo "Error: Timeout waiting for resources to exist (timeout: ${poll_timeout}s)" >&2
             return 1
         fi
         sleep $poll_interval
         elapsed=$((elapsed + poll_interval))
     done
+    # Re-enable set -e
+    set -e
 
     # Resources exist, now execute kubectl wait with all original arguments
     kubectl wait "${wait_args[@]}"
