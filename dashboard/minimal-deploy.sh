@@ -5,6 +5,8 @@ set -euo pipefail
 # Get script directory in a POSIX-compliant way
 # This resolves symlinks and returns the absolute path
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
+SETUP_KIND="${SCRIPT_DIR}/../setup/setup-kind"
+MANIFEST_BUILD="${SCRIPT_DIR}/manifest-build.sh"
 
 # Colors for output
 RED='\033[0;31m'
@@ -42,82 +44,134 @@ fi
 
 # Global variables (set during setup)
 BASE_DIR=""
-OWNER=""
-REPO=""
-BRANCH=""
+SOURCE_MODE="" # "remote" or "local"
 
-# Function to replace image tag for a specific image in manifests
-# Usage: replace_image_tag <manifest_file> <image_name> [old_tag] [new_tag]
-# Example: replace_image_tag manifests.yaml "ghcr.io/kubeflow/dashboard/profile-controller" "latest" "integration-test"
-replace_image_tag() {
-  local manifest_file="$1"
-  local image_name="$2"
-  local old_tag="${3:-latest}"
-  local new_tag="${4:-${IMAGE_TAG}}"
+usage() {
+  echo "Usage: $(basename "$0") [--remote-ref <owner>/<repo>/<branch>] [--directory <path>]"
+  echo ""
+  echo "Options:"
+  echo "  --remote-ref <owner>/<repo>/<branch>   Clone a remote GitHub repository (branch may contain slashes)"
+  echo "  --directory <path>                      Copy a local checkout into a temp directory and use it"
+  echo ""
+  echo "If no option is specified, defaults to --remote-ref kubeflow/dashboard/main"
+  echo ""
+  echo "Examples:"
+  echo "  $(basename "$0") --remote-ref kubeflow/dashboard/main"
+  echo "  $(basename "$0") --remote-ref alokdangre/dashboard/refactor/centraldashboard-manifests"
+  echo "  $(basename "$0") --directory /path/to/local/dashboard"
+}
 
-  # Escape special characters for sed
-  local escaped_image_name=$(echo "$image_name" | sed 's/[[\.*^$()+?{|]/\\&/g')
+parse_args() {
+  local remote_ref=""
+  local directory=""
 
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS uses BSD sed - match the image name followed by :old_tag and replace with :new_tag
-    sed -i '' "s|${escaped_image_name}:${old_tag}|${escaped_image_name}:${new_tag}|g" "$manifest_file"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remote-ref)
+        if [ -n "${directory}" ]; then
+          log_error "Cannot specify both --remote-ref and --directory"
+          exit 1
+        fi
+        remote_ref="${2:-}"
+        if [ -z "${remote_ref}" ]; then
+          log_error "--remote-ref requires a value"
+          usage
+          exit 1
+        fi
+        shift 2
+        ;;
+      --directory)
+        if [ -n "${remote_ref}" ]; then
+          log_error "Cannot specify both --remote-ref and --directory"
+          exit 1
+        fi
+        directory="${2:-}"
+        if [ -z "${directory}" ]; then
+          log_error "--directory requires a value"
+          usage
+          exit 1
+        fi
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        log_error "Unknown option: $1"
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  if [ -n "${directory}" ]; then
+    SOURCE_MODE="local"
+    setup_local_directory "${directory}"
   else
-    # Linux uses GNU sed
-    sed -i "s|${escaped_image_name}:${old_tag}|${escaped_image_name}:${new_tag}|g" "$manifest_file"
+    SOURCE_MODE="remote"
+    setup_remote_clone "${remote_ref:-kubeflow/dashboard/main}"
   fi
 }
 
-# Parse command line argument in format <owner>/<repo>/<branch> (defaults: kubeflow/dashboard/main)
-# Examples:
-#   kubeflow/dashboard/main  - explicit all
-#   dashboard/main           - default owner (kubeflow)
-#   main                     - default owner and repo (kubeflow/dashboard)
-parse_input_ref() {
-  local input_ref="${1:-main}"
+# Copy a local directory into a temp directory to avoid modifying the source
+setup_local_directory() {
+  local dir="$1"
 
-  # Split input by '/' to parse components
+  # Resolve to absolute path
+  if [[ "${dir}" != /* ]]; then
+    dir="$(cd "${dir}" 2>/dev/null && pwd -P)" || {
+      log_error "Directory does not exist: $1"
+      exit 1
+    }
+  fi
+
+  if [ ! -d "${dir}" ]; then
+    log_error "Directory does not exist: ${dir}"
+    exit 1
+  fi
+
+  local temp_dir
+  temp_dir=$(mktemp -d)
+  trap "rm -rf ${temp_dir}" EXIT
+
+  log_info "Copying local directory into temp directory..."
+  cp -a "${dir}/." "${temp_dir}/"
+
+  BASE_DIR="${temp_dir}"
+  log_info "Using local directory: ${dir} (copied to ${BASE_DIR})"
+}
+
+# Clone a remote repository
+setup_remote_clone() {
+  local input_ref="$1"
+
+  # Parse owner, repo, and branch (branch may contain slashes)
   IFS='/' read -ra PARTS <<< "${input_ref}"
   local num_parts=${#PARTS[@]}
 
-  if [ "${num_parts}" -eq 3 ]; then
-    # Format: owner/repo/branch
-    OWNER="${PARTS[0]}"
-    REPO="${PARTS[1]}"
-    BRANCH="${PARTS[2]}"
-  elif [ "${num_parts}" -eq 2 ]; then
-    # Format: repo/branch (default owner)
-    OWNER="kubeflow"
-    REPO="${PARTS[0]}"
-    BRANCH="${PARTS[1]}"
-  else
-    # Format: branch (default owner and repo)
-    OWNER="kubeflow"
-    REPO="dashboard"
-    BRANCH="${input_ref}"
+  if [ "${num_parts}" -lt 3 ]; then
+    log_error "Remote URL must be in format: <owner>/<repo>/<branch>"
+    log_error "Example: kubeflow/dashboard/main"
+    exit 1
   fi
 
-  # Set defaults if not provided
-  OWNER="${OWNER:-kubeflow}"
-  REPO="${REPO:-dashboard}"
-  BRANCH="${BRANCH:-main}"
+  local owner="${PARTS[0]}"
+  local repo="${PARTS[1]}"
+  local branch="${input_ref#${PARTS[0]}/${PARTS[1]}/}"
 
-  log_info "Repository: ${OWNER}/${REPO}"
-  log_info "Branch/Commit: ${BRANCH}"
-}
+  log_info "Repository: ${owner}/${repo}"
+  log_info "Branch: ${branch}"
 
-# Clone the repository
-clone_repository() {
   local clone_dir
   clone_dir=$(mktemp -d)
   trap "rm -rf ${clone_dir}" EXIT
 
-  log_info "Cloning ${OWNER}/${REPO} repository (shallow clone)..."
-  # Try to clone with branch first (works for branch names)
-  if git clone --depth 1 --branch "${BRANCH}" "https://github.com/${OWNER}/${REPO}.git" "${clone_dir}" 2>/dev/null; then
-    log_info "Successfully cloned branch '${BRANCH}'"
+  log_info "Cloning ${owner}/${repo} repository (shallow clone)..."
+  if git clone --depth 1 --branch "${branch}" "https://github.com/${owner}/${repo}.git" "${clone_dir}" 2>/dev/null; then
+    log_info "Successfully cloned branch '${branch}'"
   else
-    # If branch clone failed, clone default branch and then checkout the specific ref
-    log_info "Branch clone failed"
+    log_error "Failed to clone branch '${branch}' from ${owner}/${repo}"
     exit 1
   fi
 
@@ -161,162 +215,124 @@ patch_makefiles() {
   fi
 }
 
-# Step 1: Create kind cluster
-setup_kind_cluster() {
-  log_info "Creating kind cluster..."
-  if ! command -v new-kind &> /dev/null; then
-    log_error "new-kind command not found. Please ensure it's in your PATH."
-    exit 1
-  fi
-  new-kind
+# Build a docker image and load it into kind
+# Usage: build_and_load <component_dir> <image_name>
+build_and_load() {
+  local component_dir="$1"
+  local image_name="$2"
+
+  log_info "Building image: ${image_name}:${IMAGE_TAG}"
+  ${MAKE} -C "${BASE_DIR}/components/${component_dir}" docker-build IMG="${image_name}" TAG="${IMAGE_TAG}" ARCH="linux/arm64"
+
+  log_info "Loading image into kind: ${image_name}:${IMAGE_TAG}"
+  kind load docker-image "${image_name}:${IMAGE_TAG}"
 }
 
-# Step 2: Install cert-manager
-install_cert_manager() {
-  log_info "Installing cert-manager..."
-  if [ -f "${BASE_DIR}/testing/gh-actions/install_cert_manager.sh" ]; then
-    bash "${BASE_DIR}/testing/gh-actions/install_cert_manager.sh"
-  else
-    log_warn "cert-manager install script not found at ${BASE_DIR}/testing/gh-actions/install_cert_manager.sh"
-    log_warn "Skipping cert-manager installation. Please install manually if needed."
-  fi
-
-  rm -f "${SCRIPT_DIR}/cert-manager.yaml"
-}
-
-# Step 3: Install Istio
-install_istio() {
-  log_info "Installing Istio..."
-  if [ -f "${BASE_DIR}/testing/gh-actions/install_istio.sh" ]; then
-    bash "${BASE_DIR}/testing/gh-actions/install_istio.sh"
-  else
-    log_warn "Istio install script not found at ${BASE_DIR}/testing/gh-actions/install_istio.sh"
-    log_warn "Skipping Istio installation. Please install manually if needed."
-  fi
-
-  rm -rf "${SCRIPT_DIR}/istio_tmp"
-}
-
-# Step 4: Create kubeflow namespace
-create_kubeflow_namespace() {
-  log_info "Creating kubeflow namespace..."
-  kubectl create namespace "${KUBEFLOW_NAMESPACE}" || kubectl get namespace "${KUBEFLOW_NAMESPACE}"
-}
-
-# Step 5: Build and deploy profile-controller
+# Deploy profile-controller and access-management
+# Note: profile-controller's overlay references both images, so we can't use
+# manifest-build.sh directly (it only handles one image substitution at a time).
 deploy_profile_controller() {
   log_info "Building and deploying profile-controller..."
-  pushd "${BASE_DIR}" > /dev/null
 
   local PROFILE_IMG="ghcr.io/kubeflow/dashboard/profile-controller"
   local KFAM_IMG="ghcr.io/kubeflow/dashboard/access-management"
 
-  ${MAKE} -C components/profile-controller docker-build IMG="${PROFILE_IMG}" TAG="${IMAGE_TAG}" ARCH="linux/arm64"
-  ${MAKE} -C components/access-management docker-build IMG="${KFAM_IMG}" TAG="${IMAGE_TAG}" ARCH="linux/arm64"
+  build_and_load "profile-controller" "${PROFILE_IMG}"
+  build_and_load "access-management" "${KFAM_IMG}"
 
-  kind load docker-image "${PROFILE_IMG}:${IMAGE_TAG}"
-  kind load docker-image "${KFAM_IMG}:${IMAGE_TAG}"
+  local PROFILE_IMG_ESCAPED=$(echo "$PROFILE_IMG" | sed 's|\.|\\.|g')
+  local KFAM_IMG_ESCAPED=$(echo "$KFAM_IMG" | sed 's|\.|\\.|g')
 
-  local NEW_PROFILE_IMAGE="${PROFILE_IMG}:${IMAGE_TAG}"
-  local NEW_KFAM_IMAGE="${KFAM_IMG}:${IMAGE_TAG}"
-
-  # Escape "." in the image names, as it is a special character in sed
-  local CURRENT_PROFILE_IMAGE_ESCAPED=$(echo "$PROFILE_IMG" | sed 's|\.|\\.|g')
-  local NEW_PROFILE_IMAGE_ESCAPED=$(echo "$NEW_PROFILE_IMAGE" | sed 's|\.|\\.|g')
-  local CURRENT_KFAM_IMAGE_ESCAPED=$(echo "$KFAM_IMG" | sed 's|\.|\\.|g')
-  local NEW_KFAM_IMAGE_ESCAPED=$(echo "$NEW_KFAM_IMAGE" | sed 's|\.|\\.|g')
-
-  echo "Deploying Profile Controller and KFAM to kubeflow namespace"
-  kustomize build components/profile-controller/config/overlays/kubeflow \
-      | sed "s|${CURRENT_PROFILE_IMAGE_ESCAPED}:[a-zA-Z0-9_.-]*|${NEW_PROFILE_IMAGE_ESCAPED}|g" \
-      | sed "s|${CURRENT_KFAM_IMAGE_ESCAPED}:[a-zA-Z0-9_.-]*|${NEW_KFAM_IMAGE_ESCAPED}|g" \
+  log_info "Deploying profile-controller and access-management"
+  kustomize build "${BASE_DIR}/components/profile-controller/config/overlays/kubeflow" \
+      | sed "s|${PROFILE_IMG_ESCAPED}:[a-zA-Z0-9_.-]*|${PROFILE_IMG}:${IMAGE_TAG}|g" \
+      | sed "s|${KFAM_IMG_ESCAPED}:[a-zA-Z0-9_.-]*|${KFAM_IMG}:${IMAGE_TAG}|g" \
       | kubectl apply -f -
 
   kubectl wait --for=condition=Available deployment -n "${KUBEFLOW_NAMESPACE}" profiles-deployment --timeout="${TIMEOUT}"
   kubectl wait pods -n "${KUBEFLOW_NAMESPACE}" -l kustomize.component=profiles --for=condition=Ready --timeout="${TIMEOUT}"
+}
 
-  #kubectl wait --for condition=established --timeout=60s crd/profiles.kubeflow.org
+# Deploy a component using manifest-build.sh
+# Usage: deploy_component <component_dir> <image_name> <manifests_path> <overlay>
+deploy_component() {
+  local component_dir="$1"
+  local image_name="$2"
+  local manifests_path="$3"
+  local overlay="$4"
+
+  build_and_load "${component_dir}" "${image_name}"
+
+  log_info "Deploying ${component_dir} manifests"
+  pushd "${BASE_DIR}/components/${component_dir}" > /dev/null
+  "${MANIFEST_BUILD}" \
+    --manifests-path "${manifests_path}" \
+    --image-name "${image_name}" \
+    --tag "${IMAGE_TAG}" \
+    --overlay "${overlay}" \
+    --apply
   popd > /dev/null
 }
 
-# Step 7: Build and deploy poddefaults-webhooks
 deploy_poddefaults_webhooks() {
-  log_info "Building and deploying poddefaults-webhooks..."
-  pushd "${BASE_DIR}" > /dev/null
-
-  "${BASE_DIR}/testing/shared/deploy_component.sh" components/poddefaults-webhooks "ghcr.io/kubeflow/dashboard/poddefaults-webhook" "${IMAGE_TAG}" "manifests" "overlays/cert-manager"
-
-  # podman build --platform "linux/amd64" --tag "ghcr.io/kubeflow/dashboard/poddefaults-webhooks:${IMAGE_TAG}" .
-  # kind load docker-image "ghcr.io/kubeflow/dashboard/poddefaults-webhooks:${IMAGE_TAG}"
-  # kustomize build manifests/overlays/cert-manager > manifests.yaml
-  # replace_image_tag manifests.yaml "ghcr.io/kubeflow/dashboard/poddefaults-webhooks"
-  # kubectl apply -f manifests.yaml
+  deploy_component "poddefaults-webhooks" "ghcr.io/kubeflow/dashboard/poddefaults-webhook" "manifests" "overlays/cert-manager"
 
   kubectl wait --for=condition=Ready pods -n "${KUBEFLOW_NAMESPACE}" -l app=poddefaults --timeout="${TIMEOUT}"
   kubectl wait --for=condition=Available deployment -n "${KUBEFLOW_NAMESPACE}" poddefaults-webhook-deployment --timeout="${TIMEOUT}"
-
-  popd > /dev/null
-
 }
 
-# Step 8: Build and deploy centraldashboard
 deploy_centraldashboard() {
-  log_info "Building and deploying centraldashboard..."
-
-  pushd "${BASE_DIR}" > /dev/null
-
-  TAG="${IMAGE_TAG}" "${BASE_DIR}/testing/shared/install_centraldashboard.sh"
-
-  popd > /dev/null
+  deploy_component "centraldashboard" "ghcr.io/kubeflow/dashboard/dashboard" "manifests/kustomize" "overlays/istio"
 }
 
-# Step 9: Build and deploy centraldashboard-angular
 deploy_centraldashboard_angular() {
-  log_info "Building and deploying centraldashboard-angular..."
-  pushd "${BASE_DIR}" > /dev/null
+  deploy_component "centraldashboard-angular" "ghcr.io/kubeflow/dashboard/dashboard-angular" "manifests" "overlays/istio"
+}
 
-  cd "${BASE_DIR}/components/centraldashboard-angular"
-  export NG_CLI_ANALYTICS="ci"
+# Create an example Profile for testing
+create_example_profile() {
+  log_info "Creating example Profile..."
+  kubectl apply -f - <<'EOF'
+apiVersion: kubeflow.org/v1
+kind: Profile
+metadata:
+  name: kubeflow-user-example-com
+spec:
+  owner:
+    kind: User
+    name: user@example.com
+EOF
 
-  # Build common library if needed
-  if [ -f "Makefile" ] && grep -q "build-common-lib" Makefile; then
-    log_info "Building common library for centraldashboard-angular..."
-    # Check if nvm is available and use the specified Node version
-    if command -v nvm &> /dev/null || [ -s "$HOME/.nvm/nvm.sh" ]; then
-      source "$HOME/.nvm/nvm.sh" 2>/dev/null || true
-      nvm use v16.20.2 2>/dev/null || log_warn "nvm use v16.20.2 failed, continuing..."
-    fi
-    ${MAKE} build-common-lib || log_warn "${MAKE} build-common-lib failed, continuing..."
-  fi
-
-  cd "${BASE_DIR}"
-
-  TAG="${IMAGE_TAG}" "${BASE_DIR}/testing/shared/install_centraldashboard_angular.sh"
-
-  popd > /dev/null
+  log_info "Waiting for profile namespace to be active..."
+  kubectl wait "namespaces/kubeflow-user-example-com" \
+    --for=jsonpath='{.status.phase}'=Active \
+    --timeout="${TIMEOUT}"
+  log_info "Profile namespace is active"
 }
 
 # Main execution
 main() {
-  # Parse input and setup
-  parse_input_ref "${1:-main}"
-  clone_repository
+  # Parse arguments and setup source directory
+  parse_args "$@"
   patch_makefiles
 
-  # Setup cluster and prerequisites
-  setup_kind_cluster
-  install_cert_manager
-  install_istio
-  create_kubeflow_namespace
+  # Setup cluster with Kubeflow core infrastructure
+  log_info "Setting up kind cluster with Kubeflow core..."
+  "${SETUP_KIND}" --core
 
   # Deploy components
   deploy_profile_controller
+  create_example_profile
   deploy_poddefaults_webhooks
   deploy_centraldashboard
   deploy_centraldashboard_angular
 
   log_info "All components deployed successfully!"
   log_info "Kubeflow dashboard setup complete in namespace: ${KUBEFLOW_NAMESPACE}"
+  log_info ""
+  log_info "To access the dashboard:"
+  log_info "  kubectl -n istio-system port-forward svc/istio-ingressgateway 9090:80"
+  log_info "  Then open http://localhost:9090"
 }
 
 # Execute main function

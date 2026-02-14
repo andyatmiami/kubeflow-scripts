@@ -31,12 +31,13 @@ _usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-    --plain       Create a basic kind cluster (default)
-    --kubeflow    Create a kind cluster with Kubeflow installed
-    --notebooks-v1   Create a kind cluster with Kubeflow and Notebooks v1 installed
-    --notebooks-v2   Create a kind cluster with Kubeflow and Notebooks v2 installed
-    --podman      Use podman as the container runtime for kind (default: docker)
-    --debug       Enable debug mode (set -x) to show all commands executed
+    --plain          Create a basic kind cluster (default)
+    --core           Create a kind cluster with Kubeflow core (cert-manager, istio, dex, oauth2-proxy)
+    --dashboard      Create a kind cluster with Kubeflow core + centraldashboard and profiles
+    --notebooks-v1   Create a kind cluster with Kubeflow + Notebooks v1
+    --notebooks-v2   Create a kind cluster with Kubeflow + Notebooks v2
+    --podman         Use podman as the container runtime for kind (default: docker)
+    --debug          Enable debug mode (set -x) to show all commands executed
 
 Only one mode option may be specified at a time.
 EOF
@@ -95,12 +96,21 @@ _parse_args() {
                 flag_count=$((flag_count + 1))
                 shift
                 ;;
-            --kubeflow)
+            --core)
                 if [ $flag_count -gt 0 ]; then
                     echo "Error: Only one mode flag may be specified at a time" >&2
                     _usage
                 fi
-                mode="kubeflow"
+                mode="core"
+                flag_count=$((flag_count + 1))
+                shift
+                ;;
+            --dashboard)
+                if [ $flag_count -gt 0 ]; then
+                    echo "Error: Only one mode flag may be specified at a time" >&2
+                    _usage
+                fi
+                mode="dashboard"
                 flag_count=$((flag_count + 1))
                 shift
                 ;;
@@ -280,7 +290,7 @@ EOF
     )"
 }
 
-_setup_kubeflow() {
+_setup_kubeflow_core() {
     local manifests_path="common/kubeflow-namespace/base"
     kubectl apply -k "${kubeflow_repo_url}/${manifests_path}?ref=${kubeflow_manifests_ref}"
 
@@ -342,7 +352,9 @@ _setup_kubeflow() {
         --for=condition=Ready \
         --all \
         --timeout=180s
+}
 
+_setup_kubeflow_dashboard() {
     kubectl apply -k "${kubeflow_repo_url}/applications/profiles/upstream/overlays/kubeflow?ref=${kubeflow_manifests_ref}"
 
     # wait for pods to be ready
@@ -385,6 +397,7 @@ _setup_kubeflow() {
         )' \
      | kubectl apply -f -
 }
+
 
 _setup_notebooks_v1() {
 
@@ -704,18 +717,24 @@ _main() {
         plain)
             # Just the base cluster, nothing more to do
             ;;
-        kubeflow)
-            _setup_kubeflow
+        core)
+            _setup_kubeflow_core
+            ;;
+        dashboard)
+            _setup_kubeflow_core
+            _setup_kubeflow_dashboard
             ;;
         notebooks-v1)
-            _setup_kubeflow
+            _setup_kubeflow_core
+            _setup_kubeflow_dashboard
             _setup_notebooks_v1
             _setup_notebooks_v1_sample_data
             _setup_local_access
             _display_next_steps
             ;;
         notebooks-v2)
-            _setup_kubeflow
+            _setup_kubeflow_core
+            _setup_kubeflow_dashboard
             _get_notebooks_commit_sha
             _setup_notebooks_v2
             _setup_notebooks_v2_sample_data
