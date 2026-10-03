@@ -558,18 +558,22 @@ resolve_starting_point() {
 
 # Compute candidates and let the user select which ones to cherry-pick.
 select_cherry_picks() {
-  # Candidates: commits on notebooks-v2 that are reachable from $REMOTE/$MAIN_BRANCH
-  # but not from $REMOTE/$RELEASE_BRANCH, since the starting point.
+  # Candidates: commits on $MAIN_BRANCH whose patch is NOT already present on
+  # $RELEASE_BRANCH. We use `--cherry-pick --right-only` on a symmetric range
+  # so that commits already cherry-picked into the release branch (under a
+  # different SHA) are correctly excluded by patch-id equivalence. This is the
+  # authoritative "what will actually be picked" set; $STARTING_POINT is kept
+  # only for user-facing context in resolve_starting_point().
   local candidates=()
   while IFS= read -r sha; do
     [[ -z "$sha" ]] && continue
     candidates+=("$sha")
-  done < <(git log --no-merges --reverse --pretty='%H' \
-             "$STARTING_POINT..$REMOTE/$MAIN_BRANCH" \
-             "^$REMOTE/$RELEASE_BRANCH")
+  done < <(git log --no-merges --reverse --cherry-pick --right-only \
+             --pretty='%H' \
+             "$REMOTE/$RELEASE_BRANCH...$REMOTE/$MAIN_BRANCH")
 
   if [[ ${#candidates[@]} -eq 0 ]]; then
-    log_warn "no candidate commits found on $MAIN_BRANCH since $STARTING_POINT that aren't already on $RELEASE_BRANCH"
+    log_warn "no candidate commits found on $MAIN_BRANCH that aren't already on $RELEASE_BRANCH (by patch-id)"
     SELECTED=()
     return 0
   fi
