@@ -82,6 +82,11 @@ CLEAN=false
 KEEP=false
 ONLY=""
 FROM=""
+# Set to true once draft_github_release (the last phase) has actually run to
+# completion in this invocation. Cleanup is only ever offered when this is
+# true, so a recovery run like --only tag_release can't delete a scratch dir
+# that a later phase (e.g. draft_github_release) still needs.
+RELEASE_FULLY_COMPLETE=false
 
 # Derived from VERSION:
 RELEASE_TYPE=""       # alpha | beta | rc | ga
@@ -1150,7 +1155,9 @@ on_success() {
   log_info "${GREEN}${BOLD}Release automation completed for $VERSION${NC}"
   log_info "State log: ${STATE_LOG:-<none>}"
   if $EXECUTE && [[ -d "$SCRATCH_DIR" ]] && ! $KEEP; then
-    if confirm "remove scratch dir $BASE_DIR?"; then
+    if ! $RELEASE_FULLY_COMPLETE; then
+      log_info "scratch dir kept at $BASE_DIR (not offering cleanup: this run did not reach draft_github_release, the final phase)"
+    elif confirm "remove scratch dir $BASE_DIR?"; then
       rm -rf "$BASE_DIR"
       log_info "scratch dir removed"
     else
@@ -1226,6 +1233,7 @@ main() {
       draft_github_release)      phase_draft_github_release ;;
       *) die "unknown phase: $phase" ;;
     esac
+    [[ "$phase" == "draft_github_release" ]] && RELEASE_FULLY_COMPLETE=true
   done
 
   on_success
