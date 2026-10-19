@@ -121,6 +121,18 @@ run() {
   fi
 }
 
+# Releases require signed commits/tags. Preflight only checks that signing is
+# configured; this explains failures where the key is configured but unusable.
+die_signing() {
+  local what="$1"
+  die "failed to sign ${what}. Releases require signed commits and tags.
+  user.signingkey : $(git config --get user.signingkey || echo '<unset>')
+  gpg.format      : $(git config --get gpg.format || echo 'openpgp')
+  Check that the key is usable (ssh: key loaded in ssh-agent / file readable;
+  openpgp: gpg-agent running, passphrase available), then re-run this phase.
+  Quick test: git commit --allow-empty -S -m signing-test  (in any scratch repo)"
+}
+
 # Append a line to the state log (mutations only).
 # Usage: log_mutation "<description>" "<undo hint>"
 log_mutation() {
@@ -530,7 +542,9 @@ resolve_starting_point() {
   echo "    commits on $MAIN_BRANCH ahead of starting point : $ahead"
   echo
 
-  local chosen="$guessed"
+  # No tag yet on the release branch (e.g. first rc.0 cut from $MAIN_BRANCH):
+  # fall back to the branch tip so the prompt always has a valid default.
+  local chosen="${guessed:-$(git rev-parse "$REMOTE/$RELEASE_BRANCH")}"
   local reply
   while true; do
     read -r -p "${YELLOW}Use '${chosen}' as starting point?  [Y] yes  [n] no, enter different  [q] abort: ${NC}" reply
@@ -651,7 +665,13 @@ apply_cherry_picks() {
     log_info "[$i/$total] cherry-picking ${sha:0:8}  $subj"
 
     if $EXECUTE; then
-      if ! git cherry-pick "$sha"; then
+      if ! git cherry-pick -xS "$sha"; then
+        # No unmerged paths means the pick applied cleanly but the commit
+        # itself failed (almost always signing) — not a conflict.
+        if [[ -z "$(git diff --name-only --diff-filter=U)" ]]; then
+          git cherry-pick --abort >/dev/null 2>&1 || true
+          die_signing "cherry-pick of ${sha:0:8}"
+        fi
         # Conflict: pause with recovery menu.
         echo
         log_error "cherry-pick of $sha failed with conflicts"
@@ -676,7 +696,7 @@ Recovery options:
        # edit conflicting files, then:
        git add <files>
        git cherry-pick --continue
-       # apply any remaining commits by hand (git cherry-pick <sha>),
+       # apply any remaining commits by hand (git cherry-pick -xS <sha>),
        # then re-run: $0 --version $VERSION --execute --only bump_version_and_manifests
 
   C) Abort the whole release:
@@ -684,10 +704,12 @@ Recovery options:
 EOF
         die "cherry-pick paused for manual intervention"
       fi
+      git verify-commit HEAD >/dev/null 2>&1 \
+        || die_signing "cherry-pick of ${sha:0:8} (verify-commit failed)"
       applied+=("$sha")
       remaining=("${remaining[@]:1}")
     else
-      log_dry "git cherry-pick $sha"
+      log_dry "git cherry-pick -xS $sha"
       applied+=("$sha")
     fi
   done
@@ -718,6 +740,14 @@ phase_cherry_pick() {
     git reset --hard "$REMOTE/$RELEASE_BRANCH"
   else
     log_dry "git checkout $RELEASE_BRANCH && git reset --hard $REMOTE/$RELEASE_BRANCH"
+  fi
+
+  # Release branch already contains every patch on $MAIN_BRANCH (e.g. rc.0 for
+  # a GA line, which is always aligned with $MAIN_BRANCH): nothing to pick.
+  if [[ -z "$(git log --no-merges --cherry-pick --right-only --pretty='%H' \
+                "$REMOTE/$RELEASE_BRANCH...$REMOTE/$MAIN_BRANCH" | head -1)" ]]; then
+    log_info "cherry_pick: skipped ($RELEASE_BRANCH already contains all commits on $MAIN_BRANCH)"
+    return 0
   fi
 
   local STARTING_POINT=""
@@ -817,7 +847,12 @@ phase_bump_version_and_manifests() {
     || die "release commit declined"
 
   run git add "${EXPECTED_DIFF_FILES[@]}"
-  run git commit -s -m "$PR_TITLE"
+  if $EXECUTE; then
+    git commit -sS -m "$PR_TITLE" || die_signing "release commit on $HEAD_BRANCH"
+    git verify-commit HEAD >/dev/null 2>&1 || die_signing "release commit on $HEAD_BRANCH (verify-commit failed)"
+  else
+    log_dry "git commit -sS -m \"$PR_TITLE\""
+  fi
   log_mutation "created release commit on $HEAD_BRANCH: $PR_TITLE" \
     "git branch -D $HEAD_BRANCH"
 }
@@ -955,7 +990,7 @@ phase_tag_release() {
       die "local tag $VERSION already exists — refusing to overwrite"
     fi
 
-    git tag -s "$VERSION" -m "$VERSION"
+    git tag -s "$VERSION" -m "$VERSION" || die_signing "tag $VERSION"
     git verify-tag "$VERSION" || die "tag $VERSION verify FAILED"
     log_mutation "created signed tag $VERSION locally" "git tag -d $VERSION"
     log_info "signed tag created and verified locally"
@@ -978,13 +1013,25 @@ phase_tag_release() {
 # Phase: draft_github_release
 # ---------------------------------------------------------------------------
 
-# Compute previous same-suffix tag, if applicable (e.g. alpha.3 -> alpha.2).
+# Compute previous prerelease tag, if applicable:
+#   alpha.3 -> alpha.2, beta.0 -> latest alpha.N, rc.0 -> latest beta.N
+# Earlier-stage tags live on a different release branch, so search all tags
+# rather than only those merged into $RELEASE_BRANCH.
 compute_prev_same_suffix_tag() {
   local prev=""
-  if [[ -n "$SUFFIX_STAGE" && "$SUFFIX_NUM" -gt 0 ]]; then
+  [[ -n "$SUFFIX_STAGE" ]] || { echo ""; return; }
+
+  if [[ "$SUFFIX_NUM" -gt 0 ]]; then
     prev="v${MAJOR}.${MINOR}.${PATCH}-${SUFFIX_STAGE}.$((SUFFIX_NUM - 1))"
-    if ! git rev-parse --verify "refs/tags/$prev" >/dev/null 2>&1; then
-      prev=""
+    git rev-parse --verify "refs/tags/$prev" >/dev/null 2>&1 || prev=""
+  else
+    local prior_stage=""
+    case "$SUFFIX_STAGE" in
+      beta) prior_stage="alpha" ;;
+      rc)   prior_stage="beta" ;;
+    esac
+    if [[ -n "$prior_stage" ]]; then
+      prev="$(git tag --list --sort=-v:refname "v${MAJOR}.${MINOR}.${PATCH}-${prior_stage}.*" | head -1)"
     fi
   fi
   echo "$prev"
@@ -1008,7 +1055,7 @@ resolve_prerelease_prev_ref() {
     log_info "Suggested previous ref for changelog link: $guessed"
   else
     log_info "No obvious previous ref (this may be a '.0' prerelease)"
-    log_info "  Hint: for beta.0, use latest alpha tag; for alpha.0, use a full 40-char SHA"
+    log_info "  Hint: for alpha.0, use a full 40-char SHA; for beta.0/rc.0, use the latest prior-stage tag"
     # Print hints
     local recent
     recent="$(git tag --list --sort=-v:refname --merged "$REMOTE/$RELEASE_BRANCH" 'v*' \
@@ -1054,7 +1101,7 @@ phase_draft_github_release() {
 
   if ! enter_scratch; then
     if $IS_PRERELEASE; then
-      log_dry "would resolve previous ref, then create DRAFT --prerelease $VERSION with alpha/beta notes template"
+      log_dry "would resolve previous ref, then create DRAFT --prerelease $VERSION with prerelease notes template"
     else
       log_dry "would create empty DRAFT release $VERSION and instruct user to complete notes in UI"
     fi
@@ -1074,11 +1121,6 @@ phase_draft_github_release() {
 
     local body
     body=$(cat <<EOF
-> [!CAUTION]
->
-> __THIS IS NOT A GA RELEASE__
-> __DO NOT USE ON ANY PRODUCTION CLUSTER__
-
 **Full Changelog**: https://github.com/${UPSTREAM_REPO}/compare/${PREV_REF}...${VERSION}
 
 **Install Instructions**: ${DEPLOY_GUIDE_URL}
